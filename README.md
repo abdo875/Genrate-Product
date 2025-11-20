@@ -1,4 +1,4 @@
-# Product Render GUI
+# GEnrate Product
 
 Tkinter desktop app that runs a local Stable Diffusion XL pipeline (via `diffusers`) to render front, side, and back views of apparel items. Each render can be zoomed, previewed, and downloaded locally.
 
