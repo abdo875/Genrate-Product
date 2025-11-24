@@ -4,9 +4,10 @@ import threading
 import json
 from datetime import datetime
 from pathlib import Path
+import re
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import logging
 
@@ -25,6 +26,13 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 
 
+def slugify(value: str) -> str:
+    """Convert arbitrary text into a filesystem-friendly slug."""
+    cleaned = re.sub(r"[^\w\s-]", "", value.lower()).strip()
+    cleaned = re.sub(r"[\s_-]+", "_", cleaned)
+    return cleaned or "product"
+
+
 def save_image_with_metadata(image: Image.Image, filepath: Path | str, metadata: Optional[Dict[str, Any]] = None):
     path_str = str(filepath)
     if path_str.lower().endswith(".png") and metadata:
@@ -39,8 +47,8 @@ def save_image_with_metadata(image: Image.Image, filepath: Path | str, metadata:
 
 
 class ImageSlot(ttk.LabelFrame):
-    def __init__(self, master: tk.Widget, view_name: str):
-        super().__init__(master, text=view_name.title())
+    def __init__(self, master: tk.Widget, view_name: str, *, title: Optional[str] = None):
+        super().__init__(master, text=title or view_name.title())
         self.view_name = view_name
         self._pil_image: Optional[Image.Image] = None
         self._photo_image: Optional[ImageTk.PhotoImage] = None
@@ -144,6 +152,23 @@ class ZoomWindow(tk.Toplevel):
         )
 
 
+class ProductPanel(ttk.LabelFrame):
+    def __init__(self, master: tk.Widget, *, title: str, base_name: str):
+        super().__init__(master, text=title, padding=8)
+        self.base_name = base_name
+        self.slots: Dict[str, ImageSlot] = {}
+
+        for idx, view in enumerate(["front", "side", "back"]):
+            slot_title = f"{view.title()} view"
+            slot = ImageSlot(self, f"{base_name}_{view}", title=slot_title)
+            slot.grid(row=0, column=idx, sticky="nsew", padx=4, pady=4)
+            self.columnconfigure(idx, weight=1)
+            self.slots[view] = slot
+
+    def set_placeholder(self, text: str):
+        for slot in self.slots.values():
+            slot.set_placeholder(text)
+
 class ProductRenderApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -157,9 +182,11 @@ class ProductRenderApp(tk.Tk):
             raise SystemExit(1) from exc
 
         self._current_thread: Optional[threading.Thread] = None
-        self.generated_images: Dict[str, Dict[str, Any]] = {}
+        self.generated_images: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self.metadata_bundle: Optional[Dict[str, Any]] = None
         self.latest_metadata_file: Optional[Path] = None
+        self.product_panels: Dict[str, ProductPanel] = {}
+        self.current_product_entries: List[Dict[str, Any]] = []
 
         self._build_ui()
 
@@ -207,16 +234,23 @@ class ProductRenderApp(tk.Tk):
         gallery = ttk.LabelFrame(container, text="Generated views", padding=12)
         gallery.pack(fill="both", expand=True)
 
-        self.image_slots = {
-            "front": ImageSlot(gallery, "Front"),
-            "side": ImageSlot(gallery, "Side"),
-            "back": ImageSlot(gallery, "Back"),
-        }
+        self.gallery_canvas = tk.Canvas(gallery, highlightthickness=0)
+        self.gallery_canvas.pack(side="left", fill="both", expand=True)
+        self.gallery_scrollbar = ttk.Scrollbar(gallery, orient="vertical", command=self.gallery_canvas.yview)
+        self.gallery_scrollbar.pack(side="right", fill="y")
+        self.gallery_canvas.configure(yscrollcommand=self.gallery_scrollbar.set)
 
-        for idx, view in enumerate(["front", "side", "back"]):
-            self.image_slots[view].grid(row=0, column=idx, sticky="nsew", padx=8, pady=8)
-            gallery.columnconfigure(idx, weight=1)
-        gallery.rowconfigure(0, weight=1)
+        self.gallery_inner = ttk.Frame(self.gallery_canvas)
+        self.gallery_window = self.gallery_canvas.create_window((0, 0), window=self.gallery_inner, anchor="nw")
+
+        def _sync_scroll_region(_evt=None):
+            self.gallery_canvas.configure(scrollregion=self.gallery_canvas.bbox("all"))
+
+        self.gallery_inner.bind("<Configure>", _sync_scroll_region)
+        self.gallery_canvas.bind(
+            "<Configure>",
+            lambda event: self.gallery_canvas.itemconfigure(self.gallery_window, width=event.width),
+        )
 
     @staticmethod
     def _compose_user_input(product_name: str, details: str, extra: str) -> str:
@@ -229,22 +263,88 @@ class ProductRenderApp(tk.Tk):
             segments.append(extra)
         return ". ".join(segments).strip()
 
+    @staticmethod
+    def _split_list(raw_value: str) -> List[str]:
+        return [segment.strip() for segment in raw_value.split(",") if segment.strip()]
+
+    def _prepare_product_entries(self, products_raw: str, designs_raw: str, extra: str) -> List[Dict[str, Any]]:
+        product_names = self._split_list(products_raw)
+        design_details = self._split_list(designs_raw)
+        entries: List[Dict[str, Any]] = []
+        if not product_names:
+            return entries
+
+        used_slugs: Dict[str, int] = {}
+        for idx, name in enumerate(product_names):
+            design = ""
+            if design_details:
+                design = design_details[idx] if idx < len(design_details) else design_details[-1]
+            user_input = self._compose_user_input(name, design, extra)
+            seed, product_id = self.api_client.start_session(user_input)
+            label = f"{name} ({design})" if design else name
+            base_slug = slugify(label)
+            slug_count = used_slugs.get(base_slug, 0)
+            used_slugs[base_slug] = slug_count + 1
+            slug = f"{base_slug}_{slug_count + 1}" if slug_count else base_slug
+            entries.append(
+                {
+                    "product_name": name,
+                    "design": design,
+                    "label": label.strip(),
+                    "user_input": user_input,
+                    "seed": seed,
+                    "product_id": product_id,
+                    "slug": slug,
+                }
+            )
+        return entries
+
+    def _build_product_gallery(self, entries: List[Dict[str, Any]]):
+        for child in self.gallery_inner.winfo_children():
+            child.destroy()
+        self.product_panels.clear()
+        for col in range(4):
+            self.gallery_inner.columnconfigure(col, weight=0)
+
+        if not entries:
+            ttk.Label(
+                self.gallery_inner,
+                text="Enter comma-separated products (and optional designs) before generating images.",
+                justify="center",
+                wraplength=560,
+            ).pack(fill="x", padx=12, pady=12)
+            return
+
+        columns = 2 if len(entries) > 1 else 1
+        for idx, entry in enumerate(entries):
+            panel = ProductPanel(self.gallery_inner, title=entry["label"], base_name=entry["slug"])
+            row = idx // columns
+            col = idx % columns
+            panel.grid(row=row, column=col, sticky="nsew", padx=8, pady=8)
+            self.gallery_inner.columnconfigure(col, weight=1)
+            self.gallery_inner.rowconfigure(row, weight=1)
+            panel.set_placeholder("Waiting to generate…")
+            self.product_panels[entry["product_id"]] = panel
+
     def _on_generate(self):
         if self._current_thread and self._current_thread.is_alive():
             messagebox.showinfo("Please wait", "Image generation is already in progress.")
             return
 
-        product_name = self.product_name.get().strip()
-        details = self.design_details.get().strip()
+        products_raw = self.product_name.get().strip()
+        details_raw = self.design_details.get().strip()
         extra = self.extra_prompt.get("1.0", "end").strip()
-        user_input = self._compose_user_input(product_name, details, extra)
 
-        if not user_input:
-            messagebox.showwarning("Missing prompt", "Please describe the product first.")
+        product_entries = self._prepare_product_entries(products_raw, details_raw, extra)
+
+        if not product_entries:
+            messagebox.showwarning("Missing prompt", "Please enter at least one product.")
             return
 
-        product_type = product_name or "product"
-        seed, product_id = self.api_client.start_session(user_input)
+        self.current_product_entries = product_entries
+        self.generated_images = {}
+        self.metadata_bundle = None
+        self._build_product_gallery(product_entries)
 
         view_requirements = {
             "front": "front view, show only the front of the product",
@@ -252,61 +352,68 @@ class ProductRenderApp(tk.Tk):
             "side": "side view of the same product, 3/4 angle",
         }
 
-        for slot in self.image_slots.values():
-            slot.set_placeholder("Generating…")
+        for panel in self.product_panels.values():
+            panel.set_placeholder("Generating…")
 
-        self.status_var.set("Generating images… this can take ~20-40 seconds.")
+        product_count = len(product_entries)
+        self.status_var.set(f"Generating {product_count * 3} images… this can take a minute.")
         self.generate_button.configure(state="disabled")
         self.download_button.configure(state="disabled")
 
         self._current_thread = threading.Thread(
             target=self._run_generation,
-            args=(user_input, product_type, view_requirements, seed, product_id),
+            args=([entry.copy() for entry in product_entries], view_requirements),
             daemon=True,
         )
         self._current_thread.start()
 
     def _run_generation(
         self,
-        user_input: str,
-        product_type: str,
+        product_entries: List[Dict[str, Any]],
         view_requirements: Dict[str, str],
-        seed: int,
-        product_id: str,
     ):
-        new_images: Dict[str, Dict[str, Any]] = {}
+        new_images: Dict[str, Dict[str, Dict[str, Any]]] = {}
         metadata_bundle = {
-            "product_id": product_id,
-            "seed": seed,
-            "user_input": user_input,
-            "product_type": product_type,
+            "batch_id": f"batch_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
             "model_id": self.api_client._model_id,
             "created_at": datetime.utcnow().isoformat(),
-            "views": {},
+            "products": [],
         }
         try:
-            for view, requirement in view_requirements.items():
-                self._update_status(f"Rendering {view} view…")
-                image, prompt = self.api_client.generate_view(
-                    user_input,
-                    product_type,
-                    extra_notes=requirement,
-                    seed=seed,
-                )
-                metadata = {
-                    "prompt": prompt,
-                    "view": view,
-                    "product_id": product_id,
-                    "seed": seed,
-                    "model_id": self.api_client._model_id,
-                    "width": self.api_client._config.width,
-                    "height": self.api_client._config.height,
-                    "num_inference_steps": self.api_client._config.inference_steps,
-                    "guidance_scale": self.api_client._config.guidance_scale,
+            for entry in product_entries:
+                product_meta = {
+                    "product_id": entry["product_id"],
+                    "product_name": entry["product_name"],
+                    "design": entry["design"],
+                    "label": entry["label"],
+                    "seed": entry["seed"],
+                    "user_input": entry["user_input"],
+                    "views": {},
                 }
-                new_images[view] = {"image": image, "metadata": metadata}
-                metadata_bundle["views"][view] = metadata
-                self._update_slot(view, image, metadata)
+                for view, requirement in view_requirements.items():
+                    self._update_status(f"Rendering {entry['label']} - {view} view…")
+                    image, prompt = self.api_client.generate_view(
+                        entry["user_input"],
+                        entry["product_name"],
+                        extra_notes=requirement,
+                        seed=entry["seed"],
+                    )
+                    metadata = {
+                        "prompt": prompt,
+                        "view": view,
+                        "product_id": entry["product_id"],
+                        "seed": entry["seed"],
+                        "model_id": self.api_client._model_id,
+                        "width": self.api_client._config.width,
+                        "height": self.api_client._config.height,
+                        "num_inference_steps": self.api_client._config.inference_steps,
+                        "guidance_scale": self.api_client._config.guidance_scale,
+                    }
+                    product_store = new_images.setdefault(entry["product_id"], {})
+                    product_store[view] = {"image": image, "metadata": metadata}
+                    product_meta["views"][view] = metadata
+                    self._update_slot(entry["product_id"], view, image, metadata)
+                metadata_bundle["products"].append(product_meta)
         except (ModelAPIError, Exception) as exc:  # broad catch to surface to the UI
             logging.exception("Generation failed")
             error_message = str(exc).strip() or exc.__class__.__name__
@@ -326,8 +433,16 @@ class ProductRenderApp(tk.Tk):
             self._update_status("All views generated (metadata save failed).")
         self._reset_after_generation(success=True)
 
-    def _update_slot(self, view: str, image: Image.Image, metadata: Dict[str, Any]):
-        self.after(0, lambda: self.image_slots[view].set_image(image, metadata))
+    def _update_slot(self, product_id: str, view: str, image: Image.Image, metadata: Dict[str, Any]):
+        def _apply():
+            panel = self.product_panels.get(product_id)
+            if not panel:
+                return
+            slot = panel.slots.get(view)
+            if slot:
+                slot.set_image(image, metadata)
+
+        self.after(0, _apply)
 
     def _update_status(self, text: str):
         self.after(0, lambda: self.status_var.set(text))
@@ -349,16 +464,27 @@ class ProductRenderApp(tk.Tk):
             return
 
         target_path = Path(target_dir)
-        for view, payload in self.generated_images.items():
-            filename = f"{view}_view.png"
-            save_image_with_metadata(payload["image"], target_path / filename, payload["metadata"])
+        saved_files = 0
+        for entry in self.current_product_entries:
+            product_payload = self.generated_images.get(entry["product_id"])
+            if not product_payload:
+                continue
+            base_name = entry.get("slug") or slugify(entry["label"])
+            for view, payload in product_payload.items():
+                filename = f"{base_name}_{view}.png"
+                save_image_with_metadata(payload["image"], target_path / filename, payload["metadata"])
+                saved_files += 1
 
-        messagebox.showinfo("Saved", f"Images saved to {target_dir}")
+        if saved_files:
+            messagebox.showinfo("Saved", f"{saved_files} images saved to {target_dir}")
+        else:
+            messagebox.showwarning("No images", "Nothing to save yet.")
 
     def _write_metadata_file(self, metadata: Dict[str, Any]) -> Path:
         output_dir = Path("generated")
         output_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{metadata['product_id']}_metadata.json"
+        batch_id = metadata.get("batch_id") or f"batch_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        filename = f"{batch_id}_metadata.json"
         target = output_dir / filename
         with target.open("w", encoding="utf-8") as fh:
             json.dump(metadata, fh, indent=2)

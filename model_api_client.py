@@ -166,6 +166,7 @@ class ModelAPIClient:
             "Content-Type": "application/json",
         }
         self._history: List[str] = []
+        self._session_counter = 0
 
     # Legacy helpers from notebook logic ---------------------------------
     def _make_seed_from_text(self, text: str) -> int:
@@ -173,13 +174,7 @@ class ModelAPIClient:
         return int(digest[:16], 16) % (2**31 - 1)
 
     def _build_prompt(self, user_input: str, product_type: str, extra_notes: str) -> str:
-        history_tail = self._history[-5:]
-        history_block = ""
-        if history_tail:
-            history_block = "previous user inputs: " + " | ".join(history_tail) + ". "
-
         base_prompt = (
-            f"{history_block}"
             f"product description: {user_input}. "
             f"product type: {product_type}. "
             "You are generating a professional PRODUCT MOCKUP for e-commerce. "
@@ -246,7 +241,8 @@ class ModelAPIClient:
         if len(self._history) > self._config.max_history:
             self._history = self._history[-self._config.max_history :]
 
-        product_id = f"product_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+        self._session_counter += 1
+        product_id = f"product_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}_{self._session_counter}"
         seed_source = " ".join(self._history[-self._config.max_history :]) + product_id
         seed = self._make_seed_from_text(seed_source)
         return seed, product_id
