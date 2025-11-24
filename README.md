@@ -13,7 +13,7 @@ Tkinter desktop app that runs a local Stable Diffusion XL pipeline (via `diffuse
 ## Quick start
 
 ```powershell
-cd "D:\Work\App for Halland"
+cd "Generate-Product"
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
